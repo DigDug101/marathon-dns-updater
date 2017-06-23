@@ -1,85 +1,17 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/route53"
-	"github.com/r3labs/sse"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 )
-
-type MarathonAPI struct {
-	Client *http.Client
-	Host   string
-	Path   string
-}
-
-func (api *MarathonAPI) urlForPath(path []string) string {
-	fullPath := append([]string{api.Host, api.Path}, path...)
-	return strings.Join(fullPath, "/")
-}
-
-func (api *MarathonAPI) rawRequest(method string, path []string, body interface{}) (*http.Response, error) {
-	url := api.urlForPath(path)
-	bodyJson, err := json.Marshal(body)
-
-	if err != nil {
-		return nil, err
-	}
-
-	buf := bytes.NewBuffer(bodyJson)
-	req, err := http.NewRequest(method, url, buf)
-
-	if err != nil {
-		return nil, err
-	}
-
-	return api.Client.Do(req)
-}
-
-func (api *MarathonAPI) getApp(appId string) (*AppResponse, error) {
-	resp, err := api.rawRequest("GET", []string{"apps", appId}, nil)
-
-	if err != nil {
-		return nil, err
-	}
-
-	if (resp.StatusCode / 100) != 2 {
-		return nil, errors.New(fmt.Sprintf("Received non-2XX status in response: %v", *resp))
-	}
-
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
-
-	if err != nil {
-		return nil, err
-	}
-
-	var app AppResponse
-	if err = json.Unmarshal(body, &app); err != nil {
-		return nil, err
-	}
-
-	return &app, nil
-}
-
-func (api *MarathonAPI) getEvents(ch chan *sse.Event) error {
-	url := api.urlForPath([]string{"events"})
-	client := sse.NewClient(url)
-
-	return client.SubscribeChan("", ch)
-}
 
 func main() {
 	host := flag.String("marathon-host", "http://marathon.mesos:8080", "HTTP endpoint of Marathon service")
