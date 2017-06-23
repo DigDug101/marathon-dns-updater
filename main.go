@@ -225,6 +225,8 @@ func main() {
 			log.Printf("Updated record set for %s successfully.", *recordSetName)
 		}
 
-		time.Sleep(time.Duration(*interval) * time.Second)
+		sleepDuration := time.Duration(*interval) * time.Second
+		log.Printf("Sleeping for %d seconds", sleepDuration)
+		time.Sleep(sleepDuration)
 	}
 }
