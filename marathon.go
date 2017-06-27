@@ -2,14 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/r3labs/sse"
+	"io/ioutil"
+	"log"
+	"net/http"
 	"strings"
 	"time"
-	"net/http"
-	"errors"
-	"io/ioutil"
+	//"bufio"
+	"bufio"
 )
 
 const (
@@ -23,6 +26,11 @@ const (
 	TaskLost     = "TASK_LOST"
 )
 
+type Event struct {
+	Type string
+	Data json.RawMessage
+}
+
 type AppResponse struct {
 	App struct {
 		ID   string      `json:"id"`
@@ -35,10 +43,10 @@ type AppResponse struct {
 			HAPROXYSYSCTLPARAMS         string `json:"HAPROXY_SYSCTL_PARAMS"`
 		} `json:"env"`
 		Instances             int           `json:"instances"`
-		Cpus                  int           `json:"cpus"`
-		Mem                   int           `json:"mem"`
-		Disk                  int           `json:"disk"`
-		Gpus                  int           `json:"gpus"`
+		Cpus                  float64       `json:"cpus"`
+		Mem                   float64       `json:"mem"`
+		Disk                  float64       `json:"disk"`
+		Gpus                  float64       `json:"gpus"`
 		Executor              string        `json:"executor"`
 		Constraints           [][]string    `json:"constraints"`
 		Uris                  []interface{} `json:"uris"`
@@ -161,7 +169,7 @@ func (api *MarathonAPI) urlForPath(path []string) string {
 	return strings.Join(fullPath, "/")
 }
 
-func (api *MarathonAPI) rawRequest(method string, path []string, body interface{}) (*http.Response, error) {
+func (api *MarathonAPI) rawRequest(method string, path []string, body interface{}) (*http.Request, error) {
 	url := api.urlForPath(path)
 	bodyJson, err := json.Marshal(body)
 
@@ -176,11 +184,21 @@ func (api *MarathonAPI) rawRequest(method string, path []string, body interface{
 		return nil, err
 	}
 
+	return req, nil
+}
+
+func (api *MarathonAPI) doRequest(method string, path []string, body interface{}) (*http.Response, error) {
+	req, err := api.rawRequest(method, path, body)
+
+	if err != nil {
+		return nil, err
+	}
+
 	return api.Client.Do(req)
 }
 
 func (api *MarathonAPI) getApp(appId string) (*AppResponse, error) {
-	resp, err := api.rawRequest("GET", []string{"apps", appId}, nil)
+	resp, err := api.doRequest("GET", []string{"apps", appId}, nil)
 
 	if err != nil {
 		return nil, err
@@ -205,9 +223,82 @@ func (api *MarathonAPI) getApp(appId string) (*AppResponse, error) {
 	return &app, nil
 }
 
-func (api *MarathonAPI) getEvents(ch chan *sse.Event) error {
-	url := api.urlForPath([]string{"events"})
-	client := sse.NewClient(url)
+func (api *MarathonAPI) getEvents(events chan<- *Event, errs chan<- *error, ctx context.Context) error {
+	req, err := api.rawRequest("GET", []string{"events"}, nil)
+	streamingClient := *api.Client
+	streamingClient.Timeout = 0
 
-	return client.SubscribeChan("", ch)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Add("Accept", "text/event-stream")
+	resp, err := streamingClient.Do(req)
+
+	if err != nil {
+		return err
+	}
+
+	sendError := func(err error) {
+		select {
+		case errs <- &err:
+		default:
+			log.Printf("No listeners on errors channel")
+		}
+	}
+
+	go func() {
+		rdr := bufio.NewReader(resp.Body)
+		for {
+			// Read event header
+			eventPart, err := rdr.ReadString('\n')
+			if err != nil {
+				sendError(err)
+				continue
+			} else if eventPart == "\r\n" {
+				log.Println("Received KEEPALIVE")
+				continue
+			}
+			eventParsed := strings.SplitN(eventPart, ":", 2)
+			eventType := strings.TrimSpace(eventParsed[1])
+
+			// Read data payload
+			dataPart, err := rdr.ReadString('\n')
+			if err != nil {
+				sendError(err)
+				continue
+			} else if dataPart == "\r\n" {
+				sendError(errors.New(
+					fmt.Sprintf("Expected data part after reading event but got CRLF")))
+				continue
+			}
+			dataParsed := strings.SplitN(dataPart, ":", 2)
+			data := []byte(strings.TrimSpace(dataParsed[1]))
+
+			// Read CRLF delimiter
+			if delim, err := rdr.ReadString('\n'); err != nil {
+				sendError(err)
+				continue
+			} else if delim != "\r\n" {
+				sendError(errors.New(
+					fmt.Sprintf("Expected CRLF after message but got %b", []byte(delim))))
+			}
+
+			log.Printf("Received eventType: %s", eventType)
+			event := &Event{
+				Type: eventType,
+				Data: data,
+			}
+
+			select {
+			case <-ctx.Done():
+				log.Println("getEvents received cancel")
+				return
+			case events <- event:
+				continue
+			}
+		}
+	}()
+
+	return nil
 }
