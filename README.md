@@ -11,8 +11,6 @@ OPTIONS:
     	Marathon app id of marathon-lb service (default "marathon-lb")
   -hosted-zone-id string
     	Route53 Hosted Zone
-  -interval int
-    	Update interval (default 360)
   -marathon-host string
     	HTTP endpoint of Marathon service (default "http://marathon.mesos:8080")
   -record-set string
