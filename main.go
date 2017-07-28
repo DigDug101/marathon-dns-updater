@@ -108,12 +108,13 @@ func updateRecords(api *MarathonAPI) *appError {
 			record := &route53.ResourceRecord{
 				Value: aws.String(ip),
 			}
+			recordIdentifier := "weighted-" + ip
 			recordSet := &route53.ResourceRecordSet{
 				Name:            recordSetName,
 				Type:            aws.String(route53.RRTypeA),
 				TTL:             aws.Int64(60),
 				Weight:          aws.Int64(10),
-				SetIdentifier:   record.Value,
+				SetIdentifier:   &recordIdentifier,
 				ResourceRecords: []*route53.ResourceRecord{record},
 			}
 			recordUpsert := &route53.Change{
@@ -137,12 +138,11 @@ func updateRecords(api *MarathonAPI) *appError {
 				}
 			}
 
-			recordSetName := fmt.Sprintf("%s-%d.%s", parts[0], idx, parts[1])
+			recordSetName := fmt.Sprintf("%s-%d.%s", parts[0], idx+1, parts[1])
 			recordSet := &route53.ResourceRecordSet{
 				Name:            &recordSetName,
 				Type:            aws.String(route53.RRTypeA),
 				TTL:             aws.Int64(60),
-				SetIdentifier:   record.Value,
 				ResourceRecords: []*route53.ResourceRecord{record},
 			}
 			recordUpsert := &route53.Change{
