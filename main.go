@@ -6,15 +6,22 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/route53"
-	"log"
-	"net/http"
-	"os"
-	"strings"
-	"time"
+)
+
+const (
+	WEIGHTED   = "weighted"
+	ENUMERATED = "enumerated"
 )
 
 type appError struct {
@@ -26,6 +33,8 @@ var host = flag.String("marathon-host", "http://marathon.mesos:8080", "HTTP endp
 var appId = flag.String("app-id", "marathon-lb", "Marathon app id of marathon-lb service")
 var hostedZoneId = flag.String("hosted-zone-id", "", "Route53 Hosted Zone")
 var recordSetName = flag.String("record-set", "marathon-lb.example.com", "Record set to update")
+var recordSetType = flag.String("record-set-type", "weighted,enumerated", "Comma separated list of record set types: weighted, enumerated")
+var recordSetTypes map[string]string = map[string]string{}
 
 func updateRecords(api *MarathonAPI) *appError {
 	// Fetch running marathon-lb tasks
@@ -87,24 +96,62 @@ func updateRecords(api *MarathonAPI) *appError {
 	}
 
 	// Ensure records for running tasks
+	// We sort by IP to prevent unnecessary re-ordering of records
+	sortedTaskIps := []string{}
 	for _, ip := range taskIps {
-		record := &route53.ResourceRecord{
-			Value: aws.String(ip),
+		sortedTaskIps = append(sortedTaskIps, ip)
+	}
+	sort.Strings(sortedTaskIps)
+
+	for idx, ip := range sortedTaskIps {
+		if recordSetTypes[WEIGHTED] != "" {
+			record := &route53.ResourceRecord{
+				Value: aws.String(ip),
+			}
+			recordSet := &route53.ResourceRecordSet{
+				Name:            recordSetName,
+				Type:            aws.String(route53.RRTypeA),
+				TTL:             aws.Int64(60),
+				Weight:          aws.Int64(10),
+				SetIdentifier:   record.Value,
+				ResourceRecords: []*route53.ResourceRecord{record},
+			}
+			recordUpsert := &route53.Change{
+				Action:            aws.String(route53.ChangeActionUpsert),
+				ResourceRecordSet: recordSet,
+			}
+			log.Printf("Creating record set %s", recordSet)
+			changes = append(changes, recordUpsert)
 		}
-		recordSet := &route53.ResourceRecordSet{
-			Name:            recordSetName,
-			Type:            aws.String(route53.RRTypeA),
-			TTL:             aws.Int64(60),
-			Weight:          aws.Int64(10),
-			SetIdentifier:   record.Value,
-			ResourceRecords: []*route53.ResourceRecord{record},
+
+		if recordSetTypes[ENUMERATED] != "" {
+			record := &route53.ResourceRecord{
+				Value: aws.String(ip),
+			}
+			parts := strings.SplitN(*recordSetName, ".", 2)
+
+			if len(parts) != 2 {
+				return &appError{
+					Error:   fmt.Errorf("record-set-name must have at least one . separator for enumerated records"),
+					IsFatal: true,
+				}
+			}
+
+			recordSetName := fmt.Sprintf("%s-%d.%s", parts[0], idx, parts[1])
+			recordSet := &route53.ResourceRecordSet{
+				Name:            &recordSetName,
+				Type:            aws.String(route53.RRTypeA),
+				TTL:             aws.Int64(60),
+				SetIdentifier:   record.Value,
+				ResourceRecords: []*route53.ResourceRecord{record},
+			}
+			recordUpsert := &route53.Change{
+				Action:            aws.String(route53.ChangeActionUpsert),
+				ResourceRecordSet: recordSet,
+			}
+			log.Printf("Creating record set %s", recordSet)
+			changes = append(changes, recordUpsert)
 		}
-		recordUpsert := &route53.Change{
-			Action:            aws.String(route53.ChangeActionUpsert),
-			ResourceRecordSet: recordSet,
-		}
-		log.Printf("Creating record set %s", recordSet)
-		changes = append(changes, recordUpsert)
 	}
 
 	changeInput := &route53.ChangeResourceRecordSetsInput{
@@ -196,6 +243,12 @@ func main() {
 
 	if !strings.HasPrefix(*appId, "/") {
 		*appId = "/" + *appId
+	}
+
+	types := strings.Split(*recordSetType, ",")
+	for _, recordSetType := range types {
+		cleanedType := strings.ToLower(strings.TrimSpace(recordSetType))
+		recordSetTypes[cleanedType] = cleanedType
 	}
 
 	client := &http.Client{
