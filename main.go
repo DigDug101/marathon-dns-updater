@@ -1,8 +1,6 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/route53"
+	marathon "github.com/gambol99/go-marathon"
 )
 
 const (
@@ -34,11 +33,13 @@ var appId = flag.String("app-id", "marathon-lb", "Marathon app id of marathon-lb
 var hostedZoneId = flag.String("hosted-zone-id", "", "Route53 Hosted Zone")
 var recordSetName = flag.String("record-set", "marathon-lb.example.com", "Record set to update")
 var recordSetType = flag.String("record-set-type", "weighted,enumerated", "Comma separated list of record set types: weighted, enumerated")
+var adminHostPort = flag.String("admin-http-port", "8080", "http port for admin/health check")
+
 var recordSetTypes map[string]string = map[string]string{}
 
-func updateRecords(api *MarathonAPI) *appError {
+func updateRecords(client marathon.Marathon) *appError {
 	// Fetch running marathon-lb tasks
-	app, err := api.getApp(*appId)
+	app, err := client.Application(*appId)
 	if err != nil {
 		msg := fmt.Sprintf("Unable to fetch appId: %s from host: %s, reason: %v", *appId, *host, err)
 		return &appError{
@@ -48,7 +49,7 @@ func updateRecords(api *MarathonAPI) *appError {
 	}
 
 	taskIps := make(map[string]string)
-	for _, task := range app.App.Tasks {
+	for _, task := range app.Tasks {
 		log.Printf("Processing task: %v", task.ID)
 		if task.State != TaskRunning {
 			continue
@@ -205,33 +206,6 @@ func updateRecords(api *MarathonAPI) *appError {
 	return nil
 }
 
-func filterStatusUpdateEvents(in <-chan *Event, ctx context.Context) <-chan *StatusUpdate {
-	out := make(chan *StatusUpdate)
-	go func() {
-		// Listen for status update events that affect our app
-		for e := range in {
-			if e.Type == StatusUpdateEvent {
-				var update StatusUpdate
-				if err := json.Unmarshal(e.Data, &update); err != nil {
-					log.Printf("Error deserialized status update: %v", err)
-					continue
-				}
-				log.Printf("Received StatusUpdateEvent: %v", update)
-				if update.AppID == *appId {
-					select {
-					case <-ctx.Done():
-						return
-					case out <- &update:
-						continue
-					}
-				}
-			}
-		}
-	}()
-
-	return out
-}
-
 func main() {
 	flag.Parse()
 
@@ -251,39 +225,57 @@ func main() {
 		recordSetTypes[cleanedType] = cleanedType
 	}
 
-	client := &http.Client{
-		Timeout: 5 * time.Second,
+	client := &http.Client{}
+
+	config := marathon.NewDefaultConfig()
+	config.URL = *host
+	config.HTTPClient = client
+	config.EventsTransport = marathon.EventsTransportSSE
+
+	marathonClient, err := marathon.NewClient(config)
+
+	if err != nil {
+		log.Fatalf("Error creating marathon client: %v", err)
 	}
 
-	api := &MarathonAPI{
-		Client: client,
-		Host:   *host,
-		Path:   "v2",
-	}
+	events, err := marathonClient.AddEventsListener(marathon.EventIDStatusUpdate)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	allEvents := make(chan *Event, 1)
-	errs := make(chan *error)
-
-	go func() {
-		for {
-			err := <-errs
-			log.Printf("Error processing events: %v", *err)
-		}
-	}()
-
-	err := api.getEvents(allEvents, errs, ctx)
 	if err != nil {
 		log.Fatalf("Error subscribing to event bus: %v", err)
 	}
-	statusUpdateEvents := filterStatusUpdateEvents(allEvents, ctx)
+	defer marathonClient.RemoveEventsListener(events)
+
+	httpAddr := "0.0.0.0:" + *adminHostPort
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		ok, err := marathonClient.Ping()
+		if err != nil || !ok {
+			http.Error(w, "NOT OK", http.StatusServiceUnavailable)
+		} else {
+			fmt.Fprintln(w, "OK")
+		}
+	})
+
+	httpServer := &http.Server{
+		Addr:         httpAddr,
+		Handler:      mux,
+		ReadTimeout:  1000 * time.Millisecond,
+		WriteTimeout: 1000 * time.Millisecond,
+	}
+	httpServer.SetKeepAlivesEnabled(false)
+
+	// Start HTTP server in background
+	go func() {
+		log.Printf("Starting HTTPServer: addr=%v", httpAddr)
+		err := httpServer.ListenAndServe()
+		log.Printf("HTTPServer exited: err=%v", err)
+	}()
+
 	// update records on startup and then only when we receive a status update event for our app
 	for {
-		err := updateRecords(api)
+		err := updateRecords(marathonClient)
 		if err != nil {
 			if err.IsFatal {
-				cancel()
 				log.Fatalf("FATAL: %v", err.Error)
 			} else {
 				log.Printf("WARNING: %v", err.Error)
@@ -292,7 +284,13 @@ func main() {
 
 		sleepDuration := 1 * time.Second // Sleep to prevent hammering the route53 api
 		time.Sleep(sleepDuration)
-		update := <-statusUpdateEvents
-		log.Printf("StatusUpdate Received: %v", update)
+		for {
+			update := <-events
+			log.Printf("StatusUpdate Received: %v", update)
+			statusUpdate, _ := update.Event.(marathon.EventStatusUpdate)
+			if statusUpdate.AppID == *appId {
+				break
+			}
+		}
 	}
 }
